@@ -1,0 +1,312 @@
+diff -uNr kernel.old/arch/x86/syscalls/syscall_32.tbl kernel.new/arch/x86/syscalls/syscall_32.tbl
+--- kernel.old/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel.new/arch/x86/syscalls/syscall_32.tbl	2020-05-01 18:11:45.431750997 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+diff -uNr kernel.old/include/linux/dynamic_dump_stack.h kernel.new/include/linux/dynamic_dump_stack.h
+--- kernel.old/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/include/linux/dynamic_dump_stack.h	2020-05-01 16:17:01.392942000 -0700
+@@ -0,0 +1,9 @@
++
++//remove function called in exit.c
++extern int kprobes_del(pid_t pid);
++//list head structure defined for the list to store dumstack structures
++extern struct list_head stackdumplist;
++//structure for the dumpmode
++struct dumpmode_t {
++	unsigned int mode;
++};
+diff -uNr kernel.old/kernel/exit.c kernel.new/kernel/exit.c
+--- kernel.old/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/kernel/exit.c	2020-05-01 18:10:00.177381542 -0700
+@@ -53,7 +53,7 @@
+ #include <linux/oom.h>
+ #include <linux/writeback.h>
+ #include <linux/shm.h>
+-
++#include <linux/dynamic_dump_stack.h>
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+ #include <asm/pgtable.h>
+@@ -655,6 +655,11 @@
+ 	int group_dead;
+ 	TASKS_RCU(int tasks_rcu_i);
+ 
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++
++	kprobes_del(tsk->pid);
++#endif
++
+ 	profile_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+diff -uNr kernel.old/lib/dynamic_dump_stack.c kernel.new/lib/dynamic_dump_stack.c
+--- kernel.old/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/lib/dynamic_dump_stack.c	2020-05-01 17:36:30.959744000 -0700
+@@ -0,0 +1,231 @@
++#include <linux/syscalls.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/kprobes.h>
++#include <linux/fs.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <linux/string.h>
++#include <linux/device.h>
++#include <linux/jiffies.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/printk.h>
++#include <linux/kallsyms.h>
++
++#include <linux/dynamic_dump_stack.h>
++
++#define MAX_LENGTH 100
++
++int global_id;  //global id defined to keep track of dumpstack id
++
++//list head initiaized from the header file
++struct list_head stackdumplist = LIST_HEAD_INIT(stackdumplist);
++//structure containing pid, tid, kprobe, mode and name for a particular instance of insdump and rmdump defined
++struct stackdump {
++
++	struct kprobe kp;
++	pid_t pid;
++	pid_t tid;
++	int id;
++	int mode;
++	char name[100];
++	struct list_head list;
++};
++
++struct stackdump *stackdumps;
++
++//structure for the removal in case the program is aborted
++struct remove {
++	struct list_head head;
++	struct list_head* addr;
++};
++
++//pre handler for the kprobe
++static int handler_pre(struct kprobe *p, struct pt_regs *regs)
++	{
++		struct task_struct* task = current;  //current data for pid, tgid taken from current.h
++		struct stackdump *stackdumps;
++		pid_t tid;
++		pid_t pid;
++		tid = task->tgid;
++		pid = task->pid;
++		//container of kprobe p in the stackdump structure for probe kp
++		stackdumps = container_of(p, struct stackdump, kp);
++		
++		printk(KERN_INFO "pre_handler: p->addr = 0x%p, ip=%lx, flags=0x%lx\n", p->addr,regs->ip,regs->flags);
++		//comparison for mode 0, checking whether it is the owner same process
++		if((stackdumps->mode == 0) && (pid == stackdumps->pid))
++		{
++			dump_stack();
++		}
++		//comparison for mode 1, checking the same parent and owner process
++		if((stackdumps->mode == 1) && ((pid == stackdumps->pid) || (tid == stackdumps->tid)))
++		{
++			dump_stack();
++		}
++		//enabled for any process in mode>1
++		if(stackdumps->mode > 1)
++		{
++			dump_stack();
++		}
++		return 0;
++	}
++
++//post handler for the kprobe
++void handler_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
++	{
++		printk(KERN_INFO "post_handler: p->addr = 0x%p, flags = 0x%lx\n", p->addr, regs->flags);
++
++		
++	
++	}
++//fault handler for the kprobe
++static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapval){
++
++	printk(KERN_INFO "fault_handler: kp->addr = 0x%p, trap #%d \n",p->addr,trapval);
++	return 0;
++}
++
++//function defined to delete the all the kprobes inserted in case of the exit or kill
++int kprobes_del(pid_t pid)
++{
++	struct stackdump *stackdumps = NULL;
++	struct remove *removes = NULL;
++	struct remove *remove_temp = NULL;
++	struct list_head* listh = NULL;
++	struct list_head del = LIST_HEAD_INIT(del);
++	
++	//check each in the list entry
++	list_for_each(listh, &stackdumplist)
++	{
++		//retrieve the stackdump structure list stored in the list
++		stackdumps = list_entry(listh, struct stackdump, list);
++		if(stackdumps->pid == pid)
++		{
++			removes = kzalloc(sizeof(struct remove), GFP_KERNEL);  //allocate memory for the remove structure
++			printk("Inside kprobes_del: Removing dumpstack id:%d\n", stackdumps->id);
++			//unregister the kprobe
++			unregister_kprobe(&stackdumps->kp);
++			removes->addr = listh;
++			list_add(&removes->head, &del);
++		}
++	}
++
++	//check and delete each entry
++	list_for_each(listh, &del)
++	{
++		remove_temp = list_entry(listh, struct remove, head);
++		list_del(remove_temp->addr);
++	}
++	
++	return 1;
++} 
++
++
++//system call for insdump
++SYSCALL_DEFINE2(insdump, const char __user *, symbolname, struct dumpmode_t __user *, mode)
++{
++
++//check if config_dynamic_dump_stack is enabled
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++
++	struct task_struct* task = current; //retrieve the current info
++	struct dumpmode_t dumpmode;
++	char *name;
++	unsigned long address;
++	int ret;
++	pid_t tid;
++	pid_t pid;
++	tid = task->tgid;
++	pid = task->pid;
++	//allocate memory to name string
++	name = kmalloc(sizeof(char)*MAX_LENGTH, GFP_KERNEL);
++	//copy the symbol name in the string
++	strncpy_from_user((char *)name, symbolname, MAX_LENGTH);
++	//search the address for the particular symbol name
++	address = kallsyms_lookup_name(name);
++	//if no address found return EINVAL
++	if(address == 0)
++	{
++		return -EINVAL;
++	}
++	//allocate memory to stackdumps structure
++	stackdumps = (struct stackdump *)kzalloc(sizeof(struct stackdump), GFP_KERNEL);
++	//copy the dumpmode from userspace in dumpmode
++	ret = copy_from_user(&dumpmode, mode, sizeof(dumpmode));
++
++	stackdumps->pid = pid;
++	stackdumps->tid = tid;
++	stackdumps->mode = dumpmode.mode;
++	snprintf(stackdumps->name, sizeof(char)*MAX_LENGTH, "%s", name);
++	//define the handlers for the kprobe
++	stackdumps->kp.pre_handler = handler_pre;
++	stackdumps->kp.post_handler = handler_post;
++	stackdumps->kp.fault_handler = handler_fault;
++	//define the address for the kprobe
++	stackdumps->kp.addr = (kprobe_opcode_t *)(void **)address;
++	//keep the count of insdump
++	stackdumps->id = global_id++;	
++	//register the kprobe
++	ret = register_kprobe(&stackdumps->kp);
++	if(ret < 0)
++	{
++		printk(KERN_INFO "kprobe failed\n");
++		return ret;
++	}
++	list_add(&stackdumps->list, &stackdumplist);  //add to the list
++	printk("Insdump Successful\n");
++	return stackdumps->id;  //return the dumpstack id
++
++#else
++
++	return 0;  //return 0, if config_dynamic_dump_stack not defined to indicate no ops
++
++#endif
++
++}
++
++//syscall for the rmdump
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid)
++{
++
++//check if config_dynamic_dump_stack is enabled
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	
++	
++	struct stackdump* stackdumps = NULL;
++	struct task_struct* task = current;
++	pid_t pid = task->pid;
++	struct list_head* listh = NULL;
++	int match=0;
++	//find and delete
++	list_for_each(listh, &stackdumplist)
++	{
++		stackdumps = list_entry(listh, struct stackdump, list);
++		if(stackdumps->id == dumpid && stackdumps->pid == pid)
++		{
++			match++;
++			printk("removing dumpstack id: %d\n", stackdumps->id);
++			break;
++		}
++	}
++	//if there is a match unregister the kprobe and delete from the list
++	if(match == 1)
++	{
++		unregister_kprobe(&stackdumps->kp);
++		list_del(listh);
++	}
++	else
++	{
++		return -EINVAL; //return EINVAL if there is no match
++	}
++	printk("Rmdump Successful\n");
++	return 1;
++#else
++	return 0;   //return 0, if config_dynamic_dump_stack not defined to indicate no ops
++#endif
++		
++}	
+diff -uNr kernel.old/lib/Kconfig.debug kernel.new/lib/Kconfig.debug
+--- kernel.old/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Kconfig.debug	2020-05-01 18:07:09.184521851 -0700
+@@ -1715,6 +1715,15 @@
+ 
+ 	  If unsure, say N.
+ 
++config DYNAMIC_DUMP_STACK
++	bool "Enable the dynamic dump stack option"
++	default n
++	help
++	  This option enables the mechanism to test the dumping of the stack dynamically. 
++
++	  If unsure, say N.
++
++
+ source "samples/Kconfig"
+ 
+ source "lib/Kconfig.kgdb"
+diff -uNr kernel.old/lib/Makefile kernel.new/lib/Makefile
+--- kernel.old/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Makefile	2020-05-01 18:06:42.001089190 -0700
+@@ -21,7 +21,7 @@
+ 
+ lib-y	+= kobject.o klist.o
+ obj-y	+= lockref.o
+-
++obj-y += dynamic_dump_stack.o
+ obj-y += bcd.o div64.o sort.o parser.o halfmd4.o debug_locks.o random32.o \
+ 	 bust_spinlocks.o hexdump.o kasprintf.o bitmap.o scatterlist.o \
+ 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iovec.o clz_ctz.o \
